@@ -1,188 +1,192 @@
-// Состояние прокси
-let proxyState = {
-    activeProfile: null,
-    isActive: false,
-    authCredentials: null,
-}
+// Состояние не держим в памяти: service worker в MV3 засыпает через ~30 с простоя,
+// поэтому активный профиль читается из chrome.storage при каждом событии.
 
-// Константы для правил
-const RULE_ID = 1
+const PROXY_SCHEMES = ['http', 'socks4', 'socks5']
+const WEBRTC_POLICY = 'disable_non_proxied_udp'
+const ICONS_ON = { 16: 'icons/icon16.png', 32: 'icons/icon32.png' }
+const ICONS_OFF = { 16: 'icons/icon16-off.png', 32: 'icons/icon32-off.png' }
 
-// Инициализация при установке/запуске
+// requestId → время ответа на запрос авторизации. Повторный запрос с тем же requestId значит,
+// что прокси отверг логин/пароль: отменяем, иначе Chrome будет слать неверные данные по кругу
+const answeredAuth = new Map()
+const AUTH_RETRY_WINDOW = 60 * 1000
+
 chrome.runtime.onInstalled.addListener(initExtension)
 chrome.runtime.onStartup.addListener(initExtension)
 
 async function initExtension() {
-    // Синхронизируем состояние с реальными настройками Chrome
-    await syncProxyState()
+    await removeLegacyAuthRules()
     await initWebRTCProtection()
-    updateBadge()
+    await serialized(getProxyStatus)
 }
 
-// Инициализация WebRTC защиты
-async function initWebRTCProtection() {
+// До 1.2.0 логин и пароль прокси ставились заголовком Proxy-Authorization через declarativeNetRequest
+// и уходили всем сайтам внутри HTTPS. Удаляем оставшиеся правила.
+async function removeLegacyAuthRules() {
     try {
-        const result = await chrome.storage.local.get(['webrtcBlocked'])
-        const isBlocked = result.webrtcBlocked !== false // По умолчанию включено
-
-        if (isBlocked) {
-            await setWebRTCPolicy('disable_non_proxied_udp')
-            console.log('🛡️ WebRTC защита инициализирована')
+        const rules = await chrome.declarativeNetRequest.getDynamicRules()
+        if (rules.length > 0) {
+            await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: rules.map((rule) => rule.id) })
+            console.log('🧹 Удалены старые правила Proxy-Authorization:', rules.length)
         }
     } catch (error) {
-        console.log('⚠️ WebRTC API недоступен:', error)
+        console.error('❌ Не удалось удалить старые правила авторизации:', error)
     }
 }
 
-// Настройка WebRTC политики через Chrome Privacy API
-async function setWebRTCPolicy(policy) {
-    try {
-        if (chrome.privacy && chrome.privacy.network && chrome.privacy.network.webRTCIPHandlingPolicy) {
-            await chrome.privacy.network.webRTCIPHandlingPolicy.set({
-                value: policy,
-                scope: 'regular',
-            })
-            console.log('✅ WebRTC политика установлена:', policy)
-        }
-    } catch (error) {
-        console.log('⚠️ Не удалось установить WebRTC политику:', error)
-    }
+// Операции с прокси выполняются строго по очереди, иначе два быстрых клика перемешивают set/get
+let queue = Promise.resolve()
+
+function serialized(task) {
+    const run = queue.then(task, task)
+    queue = run.catch(() => {})
+    return run
 }
 
-// Проверка и синхронизация состояния прокси с Chrome
-async function syncProxyState() {
+async function getActiveProfile() {
+    const { activeProfile } = await chrome.storage.local.get('activeProfile')
+    return activeProfile || null
+}
+
+function isControllable(settings) {
+    return settings.levelOfControl === 'controllable_by_this_extension' || settings.levelOfControl === 'controlled_by_this_extension'
+}
+
+function controlError(settings) {
+    if (settings.levelOfControl === 'controlled_by_other_extensions') {
+        return 'прокси управляет другое расширение, отключите его'
+    }
+    return 'прокси задан политикой и не может быть изменён'
+}
+
+// Действует ли в Chrome именно наш прокси, а не чужой или системный
+function matchesProfile(settings, profile) {
+    const proxy = settings.value.rules && settings.value.rules.singleProxy
+    return (
+        settings.levelOfControl === 'controlled_by_this_extension' &&
+        settings.value.mode === 'fixed_servers' &&
+        !!proxy &&
+        (proxy.scheme || 'http') === profile.type &&
+        proxy.host.toLowerCase() === profile.host.toLowerCase() &&
+        proxy.port === Number(profile.port)
+    )
+}
+
+function validateProfile(profile) {
+    if (!profile || typeof profile.host !== 'string' || !/^[a-z0-9_.-]+$/i.test(profile.host)) {
+        return 'некорректный адрес прокси'
+    }
+    const port = Number(profile.port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        return 'некорректный порт'
+    }
+    if (!PROXY_SCHEMES.includes(profile.type)) {
+        return 'неизвестный тип прокси'
+    }
+    if (profile.type !== 'http' && (profile.username || profile.password)) {
+        return 'Chrome не поддерживает логин и пароль для SOCKS, используйте HTTP или доступ по IP'
+    }
+    return null
+}
+
+// Сверяет сохранённый профиль с тем, что реально стоит в Chrome, и обновляет badge
+async function getProxyStatus() {
+    let status
     try {
-        // Получаем текущие настройки прокси из Chrome
-        const currentSettings = await chrome.proxy.settings.get({})
+        const [settings, profile] = await Promise.all([chrome.proxy.settings.get({}), getActiveProfile()])
 
-        // Загружаем сохраненные данные
-        const data = await chrome.storage.local.get(['activeProfile'])
-
-        console.log('🔄 Синхронизация состояния прокси:', {
-            chromeMode: currentSettings.value.mode,
-            hasActiveProfile: !!data.activeProfile,
-            currentRules: currentSettings.value.rules,
-        })
-
-        // Если в Chrome настроен прокси, но у нас нет активного профиля
-        if (currentSettings.value.mode === 'fixed_servers' && data.activeProfile) {
-            console.log('✅ Найден активный прокси, восстанавливаем состояние')
-
-            // Восстанавливаем состояние из сохраненного профиля
-            proxyState.activeProfile = data.activeProfile
-            proxyState.isActive = true
-
-            // Восстанавливаем учетные данные для авторизации
-            if (data.activeProfile.username && data.activeProfile.password) {
-                proxyState.authCredentials = {
-                    username: data.activeProfile.username,
-                    password: data.activeProfile.password,
-                }
+        if (!profile) {
+            // Осталась наша настройка без профиля — снимаем, чтобы не было «невидимого» прокси
+            if (settings.levelOfControl === 'controlled_by_this_extension') {
+                await chrome.proxy.settings.clear({})
             }
-        } else if (currentSettings.value.mode === 'direct') {
-            console.log('🔌 Chrome в режиме прямого подключения')
+            status = { state: 'off' }
+        } else if (matchesProfile(settings, profile)) {
+            status = { state: 'active', profile }
+        } else if (!isControllable(settings)) {
+            status = { state: 'conflict', profile, error: controlError(settings) }
+        } else {
+            // Профиль включён, но настройки в Chrome нет или она другая — ставим заново
+            console.log('🔄 Настройка прокси пропала, применяем профиль заново')
+            const result = await applyProxy(profile)
+            status = result.success ? { state: 'active', profile } : { state: 'off', error: result.error }
+        }
 
-            // Очищаем состояние если Chrome в прямом режиме
-            proxyState.activeProfile = null
-            proxyState.isActive = false
-            proxyState.authCredentials = null
-
-            // Очищаем сохраненный профиль
-            await chrome.storage.local.remove(['activeProfile'])
-        } else if (currentSettings.value.mode === 'fixed_servers' && !data.activeProfile) {
-            console.log('⚠️ В Chrome настроен прокси, но нет сохраненного профиля - отключаем')
-
-            // Отключаем прокси если настроен, но нет информации о профиле
-            await chrome.proxy.settings.clear({})
-            proxyState.activeProfile = null
-            proxyState.isActive = false
-            proxyState.authCredentials = null
+        if (status.state === 'active') {
+            status.exit = await getExitInfo(status.profile)
         }
     } catch (error) {
-        console.error('❌ Ошибка синхронизации состояния прокси:', error)
-
-        // В случае ошибки сбрасываем состояние
-        proxyState.activeProfile = null
-        proxyState.isActive = false
-        proxyState.authCredentials = null
+        console.error('❌ Ошибка проверки состояния прокси:', error)
+        status = { state: 'off', error: error.message }
     }
+
+    updateBadge(status)
+    return status
 }
 
-// Применение настроек прокси
 async function applyProxy(profile) {
+    const invalid = validateProfile(profile)
+    if (invalid) {
+        return { success: false, error: invalid }
+    }
+
     try {
-        console.log('🔄 Применяем прокси профиль:', profile)
+        const current = await chrome.proxy.settings.get({})
+        if (!isControllable(current)) {
+            return { success: false, error: controlError(current) }
+        }
 
-        // Очищаем предыдущие настройки
-        await chrome.proxy.settings.clear({})
-        await clearAuthRules()
-
-        // Настройка прокси
         const config = {
             mode: 'fixed_servers',
             rules: {
                 singleProxy: {
-                    scheme: profile.type || 'http',
+                    scheme: profile.type,
                     host: profile.host,
-                    port: parseInt(profile.port),
+                    port: Number(profile.port),
                 },
                 bypassList: ['localhost', '127.0.0.1', '<local>'],
             },
         }
 
-        await chrome.proxy.settings.set({ value: config, scope: 'regular' })
-        console.log('✅ Прокси настройки применены:', config)
-
-        // Настройка авторизации если нужно
-        if (profile.username && profile.password) {
-            await setupAuthRules(profile.username, profile.password)
-            proxyState.authCredentials = {
-                username: profile.username,
-                password: profile.password,
-            }
-            console.log('🔐 Учетные данные сохранены для авторизации')
-        } else {
-            proxyState.authCredentials = null
-            console.log('📝 Прокси без авторизации')
-        }
-
-        // Обновляем состояние
-        proxyState.activeProfile = profile
-        proxyState.isActive = true
+        // Профиль сохраняем до смены прокси: новый прокси может запросить авторизацию сразу
+        const previous = await getActiveProfile()
         await chrome.storage.local.set({ activeProfile: profile })
 
-        updateBadge()
-        console.log('🎉 Прокси успешно применен')
+        // Без clear() перед set(): set заменяет настройку сразу, а после clear() трафик какое-то время шёл бы напрямую
+        try {
+            await chrome.proxy.settings.set({ value: config, scope: 'regular' })
+        } catch (error) {
+            // В Chrome осталась прежняя настройка — возвращаем и прежний профиль
+            if (previous) {
+                await chrome.storage.local.set({ activeProfile: previous })
+            } else {
+                await chrome.storage.local.remove('activeProfile')
+            }
+            throw error
+        }
+
+        const applied = await chrome.proxy.settings.get({})
+        if (!matchesProfile(applied, profile)) {
+            await chrome.proxy.settings.clear({})
+            await chrome.storage.local.remove('activeProfile')
+            return { success: false, error: isControllable(applied) ? 'Chrome не применил настройки прокси' : controlError(applied) }
+        }
+
+        answeredAuth.clear()
+        await chrome.storage.local.set({ lastProfileId: profile.id })
+        console.log('✅ Прокси применён:', `${profile.type}://${profile.host}:${profile.port}`)
         return { success: true }
     } catch (error) {
         console.error('❌ Ошибка применения прокси:', error)
-
-        // В случае ошибки сбрасываем состояние
-        proxyState.activeProfile = null
-        proxyState.isActive = false
-        proxyState.authCredentials = null
-        await chrome.storage.local.remove(['activeProfile'])
-        updateBadge()
-
         return { success: false, error: error.message }
     }
 }
 
-// Отключение прокси
 async function disableProxy() {
     try {
-        console.log('🔌 Отключаем прокси...')
-
         await chrome.proxy.settings.clear({})
-        await clearAuthRules()
-
-        proxyState.activeProfile = null
-        proxyState.isActive = false
-        proxyState.authCredentials = null
-
-        await chrome.storage.local.remove(['activeProfile'])
-        updateBadge()
-        console.log('✅ Прокси успешно отключен')
+        await chrome.storage.local.remove('activeProfile')
+        console.log('🔌 Прокси отключен')
         return { success: true }
     } catch (error) {
         console.error('❌ Ошибка отключения прокси:', error)
@@ -190,19 +194,44 @@ async function disableProxy() {
     }
 }
 
-// Управление WebRTC защитой
+async function isWebRTCBlockEnabled() {
+    const { webrtcBlocked } = await chrome.storage.local.get('webrtcBlocked')
+    return webrtcBlocked !== false // По умолчанию включено
+}
+
+// Без этой политики WebRTC ходит мимо прокси по UDP и отдаёт сайту реальный IP
+async function setWebRTCPolicy(enabled) {
+    const policy = chrome.privacy.network.webRTCIPHandlingPolicy
+    if (enabled) {
+        await policy.set({ value: WEBRTC_POLICY, scope: 'regular' })
+    } else {
+        await policy.clear({ scope: 'regular' })
+    }
+}
+
+async function isWebRTCProtected() {
+    const setting = await chrome.privacy.network.webRTCIPHandlingPolicy.get({})
+    return setting.value === WEBRTC_POLICY
+}
+
+async function initWebRTCProtection() {
+    try {
+        if (await isWebRTCBlockEnabled()) {
+            await setWebRTCPolicy(true)
+        }
+    } catch (error) {
+        console.error('❌ Не удалось включить защиту WebRTC:', error)
+    }
+}
+
 async function toggleWebRTCProtection(enabled) {
     try {
         await chrome.storage.local.set({ webrtcBlocked: enabled })
+        await setWebRTCPolicy(enabled)
 
-        if (enabled) {
-            await setWebRTCPolicy('disable_non_proxied_udp')
-            console.log('🛡️ WebRTC защита включена')
-        } else {
-            await setWebRTCPolicy('default')
-            console.log('🔓 WebRTC защита отключена')
+        if (enabled && !(await isWebRTCProtected())) {
+            return { success: false, error: 'политикой WebRTC управляет другое расширение' }
         }
-
         return { success: true }
     } catch (error) {
         console.error('❌ Ошибка управления WebRTC:', error)
@@ -210,127 +239,128 @@ async function toggleWebRTCProtection(enabled) {
     }
 }
 
-// Настройка авторизации через declarativeNetRequest
-async function setupAuthRules(username, password) {
+async function getStatus() {
+    const status = await getProxyStatus()
     try {
-        console.log('Настройка авторизации для:', username)
-
-        const credentials = btoa(`${username}:${password}`)
-        console.log('Сгенерированы учетные данные, длина:', credentials.length)
-
-        const rule = {
-            id: RULE_ID,
-            priority: 10,
-            action: {
-                type: 'modifyHeaders',
-                requestHeaders: [
-                    {
-                        header: 'Proxy-Authorization',
-                        operation: 'set',
-                        value: `Basic ${credentials}`,
-                    },
-                ],
-            },
-            condition: {
-                resourceTypes: [
-                    'main_frame',
-                    'sub_frame',
-                    'stylesheet',
-                    'script',
-                    'image',
-                    'font',
-                    'xmlhttprequest',
-                    'other',
-                    'websocket',
-                    'media',
-                    'object',
-                    'ping',
-                ],
-            },
-        }
-
-        await chrome.declarativeNetRequest.updateDynamicRules({
-            addRules: [rule],
-        })
-
-        const activeRules = await chrome.declarativeNetRequest.getDynamicRules()
-        const ourRule = activeRules.find((r) => r.id === RULE_ID)
-
-        if (ourRule) {
-            console.log('✅ Правило авторизации успешно установлено')
-        } else {
-            console.error('❌ Правило авторизации не было добавлено')
-        }
+        status.webrtcBlocked = await isWebRTCBlockEnabled()
+        status.webrtcProtected = await isWebRTCProtected()
     } catch (error) {
-        console.error('Ошибка настройки авторизации:', error)
-        throw error
+        status.webrtcProtected = false
     }
+    return status
 }
 
-// Очистка правил авторизации
-async function clearAuthRules() {
-    try {
-        await chrome.declarativeNetRequest.updateDynamicRules({
-            removeRuleIds: [RULE_ID, RULE_ID + 1, RULE_ID + 2],
-        })
-        console.log('Все правила авторизации очищены')
-    } catch (error) {
-        console.log('Правила авторизации уже очищены или не существовали')
+// Внешний IP, который popup узнал через прокси. Действует, пока не сменился адрес профиля
+async function getExitInfo(profile) {
+    const { exitInfo } = await chrome.storage.local.get('exitInfo')
+    if (!exitInfo || exitInfo.profileId !== profile.id || exitInfo.host !== profile.host || exitInfo.port !== String(profile.port)) {
+        return null
     }
+    return { ip: exitInfo.ip, country: exitInfo.country, ping: exitInfo.ping }
 }
 
-// Обновление динамического индикатора (badge)
-function updateBadge() {
-    if (proxyState.isActive && proxyState.activeProfile) {
-        // Прокси включен - зеленый цвет и точка
-        chrome.action.setBadgeText({ text: '●' })
-        chrome.action.setBadgeBackgroundColor({ color: '#10b981' }) // Зеленый
-        chrome.action.setTitle({ title: `Proxy Manager - Активен: ${proxyState.activeProfile.name}` })
+async function saveExitInfo(profileId, exit) {
+    const profile = await getActiveProfile()
+    if (!profile || profile.id !== profileId || !exit || typeof exit.ip !== 'string') return
+
+    await chrome.storage.local.set({
+        exitInfo: {
+            profileId: profile.id,
+            host: profile.host,
+            port: String(profile.port),
+            ip: exit.ip,
+            country: /^[A-Z]{2}$/.test(exit.country) ? exit.country : null,
+            ping: Number.isFinite(exit.ping) ? exit.ping : null,
+        },
+    })
+}
+
+// Значок: серый — прокси выключен, цветной — включён, на бейдже страна выхода
+function updateBadge(status) {
+    const icons = status.state === 'off' ? ICONS_OFF : ICONS_ON
+    chrome.action.setIcon({ path: icons }).catch(() => {})
+
+    if (status.state === 'active') {
+        const exit = status.exit
+        chrome.action.setBadgeText({ text: (exit && exit.country) || '●' })
+        chrome.action.setBadgeBackgroundColor({ color: '#13a05a' })
+        chrome.action.setTitle({ title: `Proxy Manager — ${status.profile.name}${exit ? `, IP ${exit.ip}` : ''}` })
+    } else if (status.state === 'conflict') {
+        chrome.action.setBadgeText({ text: '!' })
+        chrome.action.setBadgeBackgroundColor({ color: '#e0434a' })
+        chrome.action.setTitle({ title: `Proxy Manager — не работает: ${status.error}` })
     } else {
-        // Прокси отключен - желтый цвет и точка
-        chrome.action.setBadgeText({ text: '●' })
-        chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' }) // Желтый
-        chrome.action.setTitle({ title: 'Proxy Manager - Отключен' })
+        chrome.action.setBadgeText({ text: '' })
+        chrome.action.setTitle({ title: 'Proxy Manager — прокси выключен' })
     }
-
-    console.log('🔄 Badge обновлен:', proxyState.isActive ? 'зеленый (активен)' : 'желтый (отключен)')
 }
 
-// Обработка запросов авторизации
+// Горячая клавиша: выключает прокси или включает последний профиль
+async function toggleProxy() {
+    const status = await getProxyStatus()
+    if (status.state !== 'off') {
+        await disableProxy()
+    } else {
+        const { profiles = [], lastProfileId } = await chrome.storage.local.get(['profiles', 'lastProfileId'])
+        const profile = profiles.find((p) => p.id === lastProfileId) || profiles[0]
+        if (!profile) return
+
+        const result = await applyProxy({ ...profile, type: profile.type || 'http' })
+        if (!result.success) {
+            console.error('❌ Не удалось включить прокси с клавиатуры:', result.error)
+        }
+    }
+    await getProxyStatus()
+}
+
+chrome.commands.onCommand.addListener((command) => {
+    if (command === 'toggle-proxy') serialized(toggleProxy)
+})
+
+function notifyPopup(message) {
+    chrome.runtime.sendMessage(message).catch(() => {})
+}
+
+async function handleAuthRequired(details) {
+    if (!details.isProxy) return {}
+
+    const profile = await getActiveProfile()
+    if (!profile || !profile.username || !profile.password) return {}
+
+    // Данные отдаём только нашему прокси, а не любому, кто спросит
+    const { host, port } = details.challenger
+    if (host.toLowerCase() !== profile.host.toLowerCase() || port !== Number(profile.port)) return {}
+
+    const now = Date.now()
+    for (const [requestId, time] of answeredAuth) {
+        if (now - time > AUTH_RETRY_WINDOW) answeredAuth.delete(requestId)
+    }
+
+    if (answeredAuth.has(details.requestId)) {
+        console.error('❌ Прокси отклонил логин или пароль')
+        notifyPopup({ action: 'proxyError', error: 'прокси отклонил логин или пароль' })
+        return { cancel: true }
+    }
+
+    answeredAuth.set(details.requestId, now)
+    return { authCredentials: { username: profile.username, password: profile.password } }
+}
+
 chrome.webRequest.onAuthRequired.addListener(
     (details, callback) => {
-        console.log('🔑 Запрос авторизации прокси:', {
-            url: details.url.substring(0, 50) + '...',
-            isProxy: details.isProxy,
-        })
-
-        if (details.isProxy && proxyState.authCredentials) {
-            console.log('✅ Предоставляем учетные данные для прокси')
-            callback({
-                authCredentials: {
-                    username: proxyState.authCredentials.username,
-                    password: proxyState.authCredentials.password,
-                },
-            })
-        } else {
-            console.log('❌ Нет учетных данных или не прокси-запрос')
+        handleAuthRequired(details).then(callback, (error) => {
+            console.error('❌ Ошибка авторизации прокси:', error)
             callback({})
-        }
+        })
     },
     { urls: ['<all_urls>'] },
     ['asyncBlocking']
 )
 
-// Обработка ошибок прокси
 chrome.proxy.onProxyError.addListener((details) => {
     console.error('Ошибка прокси:', details)
     if (details.error) {
-        chrome.runtime
-            .sendMessage({
-                action: 'proxyError',
-                error: details.error,
-            })
-            .catch(() => {})
+        notifyPopup({ action: 'proxyError', error: details.error })
     }
 })
 
@@ -338,41 +368,26 @@ chrome.proxy.onProxyError.addListener((details) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     switch (request.action) {
         case 'getStatus':
-            chrome.storage.local.get(['webrtcBlocked']).then((result) => {
-                sendResponse({
-                    isActive: proxyState.isActive,
-                    activeProfile: proxyState.activeProfile,
-                    webrtcBlocked: result.webrtcBlocked !== false,
-                })
-            })
+            serialized(getStatus).then(sendResponse)
             return true
 
         case 'applyProxy':
-            applyProxy(request.profile).then(sendResponse)
+            serialized(async () => ({ ...(await applyProxy(request.profile)), status: await getStatus() })).then(sendResponse)
             return true
 
         case 'disableProxy':
-            disableProxy().then(sendResponse)
+            serialized(async () => ({ ...(await disableProxy()), status: await getStatus() })).then(sendResponse)
             return true
 
         case 'toggleWebRTC':
-            toggleWebRTCProtection(request.enabled).then(sendResponse)
+            serialized(async () => ({ ...(await toggleWebRTCProtection(request.enabled)), status: await getStatus() })).then(sendResponse)
             return true
 
-        case 'updateBadge':
-            updateBadge()
-            sendResponse({ success: true })
-            break
-
-        case 'syncState':
-            syncProxyState().then(() => {
-                updateBadge()
-                sendResponse({ success: true })
+        case 'exitInfo':
+            serialized(async () => {
+                await saveExitInfo(request.profileId, request.exit)
+                await getProxyStatus()
             })
-            return true
+            return false
     }
 })
-
-console.log('Simple Proxy Manager с WebRTC защитой загружен')
-console.log('Динамический badge: желтый (отключен) / зеленый (включен)')
-console.log('WebRTC защита: активируется автоматически')

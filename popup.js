@@ -1,157 +1,950 @@
 // Элементы DOM
-const elements = {
-    toggleBtn: document.getElementById('toggleBtn'),
-    status: document.getElementById('status'),
-    version: document.getElementById('version'),
-    addBtn: document.getElementById('addBtn'),
-    importBtn: document.getElementById('importBtn'),
-    profilesList: document.getElementById('profilesList'),
-    modal: document.getElementById('modal'),
-    importModal: document.getElementById('importModal'),
-    modalTitle: document.getElementById('modalTitle'),
-    profileForm: document.getElementById('profileForm'),
-    cancelBtn: document.getElementById('cancelBtn'),
-    cancelImportBtn: document.getElementById('cancelImportBtn'),
-    confirmImportBtn: document.getElementById('confirmImportBtn'),
-    importText: document.getElementById('importText'),
-    useAuth: document.getElementById('useAuth'),
-    authFields: document.getElementById('authFields'),
-    webrtcToggle: document.getElementById('webrtcToggle'),
+const $ = (id) => document.getElementById(id)
+
+const els = {
+    version: $('version'),
+    hero: $('hero'),
+    webrtcToggle: $('webrtcToggle'),
+    webrtcSub: $('webrtcSub'),
+    incognitoSub: $('incognitoSub'),
+    incognitoBtn: $('incognitoBtn'),
+    incognitoOk: $('incognitoOk'),
+    count: $('count'),
+    importBtn: $('importBtn'),
+    addBtn: $('addBtn'),
+    searchWrap: $('searchWrap'),
+    search: $('search'),
+    list: $('list'),
+    overlay: $('overlay'),
+    profileSheet: $('profileSheet'),
+    profileSheetTitle: $('profileSheetTitle'),
+    profileForm: $('profileForm'),
+    quickInput: $('quickInput'),
+    quickHint: $('quickHint'),
+    nameInput: $('nameInput'),
+    typeSeg: $('typeSeg'),
+    hostInput: $('hostInput'),
+    portInput: $('portInput'),
+    authFields: $('authFields'),
+    socksNote: $('socksNote'),
+    userInput: $('userInput'),
+    passInput: $('passInput'),
+    showPassBtn: $('showPassBtn'),
+    formError: $('formError'),
+    importSheet: $('importSheet'),
+    importText: $('importText'),
+    importTypeSeg: $('importTypeSeg'),
+    importSummary: $('importSummary'),
+    importErrors: $('importErrors'),
+    exportBtn: $('exportBtn'),
+    confirmImportBtn: $('confirmImportBtn'),
+    toast: $('toast'),
+    toastText: $('toastText'),
+    toastAction: $('toastAction'),
 }
 
+// Адрес прокси: IP или домен, без схемы и порта
+const HOST_PATTERN = /^[a-z0-9_.-]+$/i
+// Поиск появляется, когда профилей больше этого числа
+const SEARCH_THRESHOLD = 6
+const TYPE_LABELS = { http: 'HTTP', socks5: 'SOCKS5', socks4: 'SOCKS4' }
+const QUICK_HINT = 'Вставьте строку — поля заполнятся сами'
+
 // Состояние
-let state = {
+const state = {
     profiles: [],
-    activeProfileId: null,
-    editingId: null,
     geoCache: {},
+    lastProfileId: null,
+    // Ответ background: state = active | conflict | off
+    status: null,
+    // Проверка через активный прокси: { ip, country, ping } или { error: true }
+    exit: null,
+    checking: false,
+    checkId: 0,
+    // Идёт включение или выключение
+    busy: false,
+    applyingId: null,
+    incognitoAllowed: true,
+    shortcut: '',
+    query: '',
+    editingId: null,
+    formType: 'http',
+    importType: 'http',
+    geoTried: new Set(),
 }
+
+const icon = (name, cls = '') => `<svg class="i ${cls}" aria-hidden="true"><use href="#i-${name}" /></svg>`
 
 // Инициализация
 document.addEventListener('DOMContentLoaded', init)
 
 async function init() {
-    await loadVersion()
-    await loadProfiles()
-    await updateStatus()
+    els.version.textContent = chrome.runtime.getManifest().version
 
-    // Запускаем проверку пингов с небольшой задержкой для лучшего UX
-    console.log('🏓 Планируем проверку пингов...')
-    setTimeout(async () => {
-        if (state.profiles.length > 0) {
-            console.log('🚀 Начинаем проверку пингов для', state.profiles.length, 'профилей')
-            await updatePings()
-        } else {
-            console.log('📋 Нет профилей для проверки пинга')
-        }
-    }, 500) // Увеличили задержку для полной загрузки UI
+    const stored = await chrome.storage.local.get(['profiles', 'geoCache', 'lastProfileId'])
+    state.profiles = (stored.profiles || []).map((profile) => ({ ...profile, type: profile.type || 'http' }))
+    state.geoCache = stored.geoCache || {}
+    state.lastProfileId = stored.lastProfileId || null
+    state.incognitoAllowed = await chrome.extension.isAllowedIncognitoAccess()
+
+    const command = (await chrome.commands.getAll()).find((c) => c.name === 'toggle-proxy')
+    state.shortcut = (command && command.shortcut) || ''
 
     bindEvents()
-}
-
-// Загрузка версии
-async function loadVersion() {
-    const manifest = chrome.runtime.getManifest()
-    elements.version.textContent = `v${manifest.version}`
+    setStatus(await chrome.runtime.sendMessage({ action: 'getStatus' }))
 }
 
 // Привязка событий
 function bindEvents() {
-    elements.toggleBtn.addEventListener('click', toggleProxy)
-    elements.addBtn.addEventListener('click', showAddForm)
-    elements.importBtn.addEventListener('click', showImportForm)
-    elements.cancelBtn.addEventListener('click', hideModal)
-    elements.cancelImportBtn.addEventListener('click', hideImportModal)
-    elements.confirmImportBtn.addEventListener('click', handleImport)
-    elements.profileForm.addEventListener('submit', handleFormSubmit)
-    elements.useAuth.addEventListener('change', toggleAuthFields)
-    elements.webrtcToggle.addEventListener('change', handleWebRTCToggle)
+    els.hero.addEventListener('click', (e) => {
+        const action = e.target.closest('[data-action]')
+        if (!action) return
+        if (action.dataset.action === 'power') onPower()
+        if (action.dataset.action === 'refresh') checkConnection()
+        if (action.dataset.action === 'copyIp') copyText(state.exit.ip, 'IP скопирован')
+    })
 
-    // Закрытие модальных окон при клике вне их
-    elements.modal.addEventListener('click', (e) => {
-        if (e.target === elements.modal) hideModal()
+    els.webrtcToggle.addEventListener('change', onWebRTCToggle)
+    els.incognitoBtn.addEventListener('click', () => {
+        chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` })
     })
-    elements.importModal.addEventListener('click', (e) => {
-        if (e.target === elements.importModal) hideImportModal()
+
+    els.addBtn.addEventListener('click', () => openProfileSheet())
+    els.importBtn.addEventListener('click', openImportSheet)
+    els.search.addEventListener('input', () => {
+        state.query = els.search.value
+        renderProfiles()
     })
+
+    els.list.addEventListener('click', onListClick)
+    els.list.addEventListener('keydown', (e) => {
+        const row = e.target.closest('.profile')
+        if (row && e.target === row && (e.key === 'Enter' || e.key === ' ')) {
+            e.preventDefault()
+            connect(row.dataset.id)
+        }
+    })
+
+    // Флаг не загрузился — показываем глобус
+    document.addEventListener(
+        'error',
+        (e) => {
+            if (e.target.classList && e.target.classList.contains('flag')) {
+                e.target.outerHTML = icon('globe')
+            }
+        },
+        true
+    )
+
+    // Нижние панели
+    els.overlay.addEventListener('click', closeSheets)
+    document.querySelectorAll('[data-close]').forEach((btn) => btn.addEventListener('click', closeSheets))
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && document.querySelector('.sheet.is-open')) {
+            e.preventDefault()
+            closeSheets()
+        } else if (e.key === '/' && !isTyping(e.target) && !els.searchWrap.classList.contains('hidden')) {
+            e.preventDefault()
+            els.search.focus()
+        }
+    })
+
+    // Форма профиля
+    els.profileForm.addEventListener('submit', onProfileSubmit)
+    els.quickInput.addEventListener('input', onQuickInput)
+    els.hostInput.addEventListener('paste', (e) => {
+        // Вставили целую строку прокси в поле адреса — разбираем её
+        const text = e.clipboardData.getData('text').trim()
+        if (text.includes(':')) {
+            e.preventDefault()
+            els.quickInput.value = text
+            onQuickInput()
+        }
+    })
+    bindSegmented(els.typeSeg, (value) => setFormType(value))
+    els.showPassBtn.addEventListener('click', () => {
+        els.passInput.type = els.passInput.type === 'password' ? 'text' : 'password'
+    })
+    els.profileForm.addEventListener('input', (e) => {
+        if (e.target.classList.contains('is-invalid')) {
+            e.target.classList.remove('is-invalid')
+            els.formError.textContent = ''
+        }
+    })
+
+    // Импорт
+    els.importText.addEventListener('input', updateImportPreview)
+    els.importText.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doImport()
+    })
+    bindSegmented(els.importTypeSeg, (value) => {
+        state.importType = value
+        updateImportPreview()
+    })
+    els.confirmImportBtn.addEventListener('click', doImport)
+    els.exportBtn.addEventListener('click', exportProfiles)
 }
 
-// Обработка переключения WebRTC защиты
-async function handleWebRTCToggle() {
-    const enabled = elements.webrtcToggle.checked
-    console.log('🛡️ Переключение WebRTC защиты:', enabled)
+function isTyping(target) {
+    return target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'
+}
 
-    try {
-        const response = await chrome.runtime.sendMessage({
-            action: 'toggleWebRTC',
-            enabled: enabled,
-        })
+// Статус от background
+function setStatus(status) {
+    const previous = state.status
+    state.status = status
 
-        if (response.success) {
-            showToast(enabled ? '🛡️ WebRTC защита включена' : '🔓 WebRTC защита отключена')
+    if (status.state === 'active') {
+        state.lastProfileId = status.profile.id
+        const sameConnection =
+            previous &&
+            previous.state === 'active' &&
+            previous.profile.id === status.profile.id &&
+            previous.profile.host === status.profile.host &&
+            previous.profile.port === status.profile.port
+        // Пока идёт проверка, показываем последний известный IP приглушённо
+        if (!sameConnection) state.exit = status.exit || null
+    } else {
+        state.exit = null
+        state.checking = false
+        state.checkId++
+    }
+
+    renderHero()
+    renderGuard()
+    renderProfiles()
+
+    if (status.state === 'active') {
+        checkConnection()
+        loadMissingGeo()
+    }
+}
+
+function lastProfile() {
+    return state.profiles.find((p) => p.id === state.lastProfileId) || state.profiles[0] || null
+}
+
+// Карточка подключения
+function renderHero() {
+    const { status, exit, checking } = state
+    if (!status) return
+
+    let cls = 'hero'
+    let stateText
+    let title
+    let line
+    let meta
+    let powerTitle
+
+    if (status.state === 'active') {
+        const failed = exit && exit.error
+        cls += failed ? ' is-unreachable' : ' is-active'
+        stateText = state.busy ? 'Отключение…' : failed ? 'Прокси не отвечает' : 'Подключено'
+        title = `<span class="ellipsis">${escapeHtml(status.profile.name)}</span>`
+
+        const refresh = `<button class="icon-btn${checking ? ' is-spinning' : ''}" data-action="refresh" title="Проверить ещё раз">${icon('refresh')}</button>`
+        if (failed) {
+            // Трафик не идёт мимо прокси, поэтому реальный IP не раскрыт
+            line = 'Сайты не открываются, IP скрыт'
+            meta = `Проверьте адрес, порт и пароль ${refresh}`
+        } else if (exit) {
+            line = `<button class="hero-ip${checking ? ' is-stale' : ''}" data-action="copyIp" title="Скопировать IP">${escapeHtml(exit.ip)}${icon('copy')}</button>`
+            const parts = []
+            if (exit.country) parts.push(`${flagImg(exit.country)}${escapeHtml(getCountryName(exit.country))}`)
+            if (exit.ping !== null && exit.ping !== undefined) parts.push(`<span class="mono">${exit.ping} ms</span>`)
+            meta = `<span class="hero-meta-text${checking ? ' is-stale' : ''}">${parts.join('<span class="sep">·</span>')}</span>${refresh}`
         } else {
-            showToast('Ошибка настройки WebRTC: ' + response.error, true)
-            // Возвращаем переключатель в предыдущее состояние
-            elements.webrtcToggle.checked = !enabled
+            line = '<span class="skeleton"></span>'
+            meta = 'Проверяем подключение…'
         }
+        powerTitle = 'Отключить'
+    } else if (status.state === 'conflict') {
+        cls += ' is-error'
+        stateText = 'Не работает'
+        title = 'Прокси перехвачен'
+        line = `<span class="ellipsis">${escapeHtml(capitalize(status.error))}</span>`
+        meta = `<span class="ellipsis">Профиль «${escapeHtml(status.profile.name)}»</span>`
+        powerTitle = 'Выключить профиль'
+    } else {
+        const last = lastProfile()
+        stateText = state.busy ? 'Подключение…' : 'Не подключено'
+        title = 'Прямое подключение'
+        line = status.error
+            ? `<span class="is-bad ellipsis">${escapeHtml(capitalize(status.error))}</span>`
+            : 'Сайты видят ваш настоящий IP'
+        if (last) {
+            const kbd = state.shortcut ? `<span class="kbd">${escapeHtml(state.shortcut)}</span>` : ''
+            meta = `<span class="ellipsis">Последний: ${escapeHtml(last.name)}</span>${kbd}`
+            powerTitle = `Подключить «${last.name}»`
+        } else {
+            meta = 'Добавьте прокси, чтобы начать'
+            powerTitle = 'Добавить прокси'
+        }
+    }
+
+    els.hero.className = cls
+    els.hero.innerHTML = `
+        <div class="hero-body">
+            <div class="hero-state"><span class="dot"></span>${stateText}</div>
+            <div class="hero-title">${title}</div>
+            <div class="hero-line">${line}</div>
+            <div class="hero-meta">${meta}</div>
+        </div>
+        <button class="power" data-action="power" title="${escapeHtml(powerTitle)}"${state.busy ? ' disabled' : ''}>
+            ${state.busy ? '<span class="spinner"></span>' : icon('power')}
+        </button>`
+}
+
+// Блок защиты
+function renderGuard() {
+    const { webrtcBlocked, webrtcProtected } = state.status
+    els.webrtcToggle.checked = !!webrtcBlocked
+
+    if (!webrtcBlocked) {
+        setText(els.webrtcSub, 'Выключено: сайты могут узнать реальный IP', 'is-warn')
+    } else if (!webrtcProtected) {
+        setText(els.webrtcSub, 'Не действует: управляет другое расширение', 'is-bad')
+    } else {
+        setText(els.webrtcSub, 'Реальный IP не утекает через WebRTC')
+    }
+
+    if (state.incognitoAllowed) {
+        setText(els.incognitoSub, 'Прокси работает и в инкогнито')
+    } else {
+        setText(els.incognitoSub, 'Там сайты видят ваш реальный IP', 'is-warn')
+    }
+    els.incognitoBtn.classList.toggle('hidden', state.incognitoAllowed)
+    els.incognitoOk.classList.toggle('hidden', !state.incognitoAllowed)
+}
+
+function setText(el, text, cls = '') {
+    el.textContent = text
+    el.title = text
+    el.classList.remove('is-ok', 'is-warn', 'is-bad')
+    if (cls) el.classList.add(cls)
+}
+
+// Список профилей
+function renderProfiles() {
+    const total = state.profiles.length
+    els.count.textContent = total || ''
+    // В пустом списке те же кнопки есть в подсказке — не дублируем их в шапке
+    els.importBtn.classList.toggle('hidden', total === 0)
+    els.addBtn.classList.toggle('hidden', total === 0)
+
+    const searchable = total > SEARCH_THRESHOLD
+    els.searchWrap.classList.toggle('hidden', !searchable)
+    if (!searchable && state.query) {
+        state.query = ''
+        els.search.value = ''
+    }
+
+    if (total === 0) {
+        els.list.innerHTML = `
+            <div class="empty">
+                <div class="empty-icon">${icon('shield')}</div>
+                <div class="empty-title">Добавьте первый прокси</div>
+                <div>Вставьте строку вида <code>user:pass@ip:port</code><br />или импортируйте список</div>
+                <div class="empty-actions">
+                    <button class="btn btn-primary btn-sm" data-action="add">${icon('plus')}Добавить</button>
+                    <button class="btn btn-secondary btn-sm" data-action="import">Импорт списка</button>
+                </div>
+            </div>`
+        return
+    }
+
+    const query = state.query.trim().toLowerCase()
+    const visible = query
+        ? state.profiles.filter((p) => p.name.toLowerCase().includes(query) || `${p.host}:${p.port}`.toLowerCase().includes(query))
+        : state.profiles
+
+    if (visible.length === 0) {
+        els.list.innerHTML = '<div class="list-note">Ничего не найдено</div>'
+        return
+    }
+
+    const activeId = state.status && state.status.state === 'active' ? state.status.profile.id : null
+    els.list.innerHTML = visible.map((profile) => profileRow(profile, profile.id === activeId)).join('')
+}
+
+function profileRow(profile, isActive) {
+    const geo = state.geoCache[profile.host]
+    const flag = geo ? flagImg(geo.country) : icon('globe')
+    const badge = profile.type !== 'http' ? `<span class="badge">${TYPE_LABELS[profile.type]}</span>` : ''
+    const actions =
+        state.applyingId === profile.id
+            ? '<span class="spinner"></span>'
+            : `<span class="profile-actions">
+                <button class="icon-btn" data-action="copy" title="Скопировать строку прокси">${icon('copy')}</button>
+                <button class="icon-btn" data-action="edit" title="Редактировать">${icon('pencil')}</button>
+                <button class="icon-btn danger" data-action="delete" title="Удалить">${icon('trash')}</button>
+            </span>`
+
+    return `
+        <div class="profile${isActive ? ' is-active' : ''}" role="button" tabindex="0" data-id="${escapeHtml(profile.id)}" title="${
+        isActive ? 'Подключено' : 'Подключить'
+    }">
+            <span class="flag-slot">${flag}</span>
+            <span class="profile-main">
+                <span class="profile-name">${escapeHtml(profile.name)}</span>
+                <span class="profile-addr"><span class="ellipsis">${escapeHtml(profile.host)}:${escapeHtml(profile.port)}</span>${badge}</span>
+            </span>
+            ${actions}
+        </div>`
+}
+
+function onListClick(e) {
+    const action = e.target.closest('[data-action]')
+    const row = e.target.closest('.profile')
+
+    if (!row) {
+        if (action && action.dataset.action === 'add') openProfileSheet()
+        if (action && action.dataset.action === 'import') openImportSheet()
+        return
+    }
+
+    const id = row.dataset.id
+    if (!action) {
+        if (!row.classList.contains('is-active')) connect(id)
+    } else if (action.dataset.action === 'copy') {
+        const profile = state.profiles.find((p) => p.id === id)
+        copyText(proxyString(profile), 'Строка прокси скопирована')
+    } else if (action.dataset.action === 'edit') {
+        openProfileSheet(id)
+    } else if (action.dataset.action === 'delete') {
+        deleteProfile(id)
+    }
+}
+
+function flagImg(country) {
+    const name = getCountryName(country)
+    return `<img class="flag" src="https://flagcdn.com/w40/${country.toLowerCase()}.png" alt="${country}" title="${escapeHtml(name)}" />`
+}
+
+// Подключение и отключение
+async function onPower() {
+    if (state.busy) return
+    if (state.status.state === 'off') {
+        const last = lastProfile()
+        if (last) {
+            await connect(last.id)
+        } else {
+            openProfileSheet()
+        }
+    } else {
+        await disconnect()
+    }
+}
+
+async function connect(profileId) {
+    const profile = state.profiles.find((p) => p.id === profileId)
+    if (!profile || state.busy) return
+
+    state.busy = true
+    state.applyingId = profileId
+    renderHero()
+    renderProfiles()
+
+    const response = await chrome.runtime.sendMessage({ action: 'applyProxy', profile })
+
+    state.busy = false
+    state.applyingId = null
+    if (!response.success) {
+        showToast(`Не удалось подключиться: ${response.error}`, { error: true })
+    }
+    setStatus(response.status)
+}
+
+async function disconnect() {
+    if (state.busy) return
+    state.busy = true
+    renderHero()
+
+    const response = await chrome.runtime.sendMessage({ action: 'disableProxy' })
+
+    state.busy = false
+    if (!response.success) {
+        showToast(`Не удалось отключить: ${response.error}`, { error: true })
+    }
+    setStatus(response.status)
+}
+
+async function onWebRTCToggle() {
+    const enabled = els.webrtcToggle.checked
+    try {
+        const response = await chrome.runtime.sendMessage({ action: 'toggleWebRTC', enabled })
+        if (!response.success) {
+            showToast(`Защита WebRTC: ${response.error}`, { error: true })
+        }
+        setStatus(response.status)
     } catch (error) {
         console.error('Ошибка управления WebRTC:', error)
-        showToast('Ошибка настройки WebRTC', true)
-        elements.webrtcToggle.checked = !enabled
+        els.webrtcToggle.checked = !enabled
+        showToast('Не удалось переключить защиту WebRTC', { error: true })
     }
 }
 
-// Загрузка профилей
-async function loadProfiles() {
-    const result = await chrome.storage.local.get(['profiles', 'geoCache'])
-    state.profiles = result.profiles || []
-    state.geoCache = result.geoCache || {}
-    renderProfiles()
+// Проверка через активный прокси
+async function fetchWithTimeout(url, timeout) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeout)
+    try {
+        const response = await fetch(url, { cache: 'no-store', signal: controller.signal })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response
+    } finally {
+        clearTimeout(timer)
+    }
 }
 
-// Сохранение профилей
+// Первый запрос открывает соединение через прокси, второй идёт по готовому — это и есть пинг
+async function measurePing() {
+    let best = null
+    for (let i = 0; i < 2; i++) {
+        const start = performance.now()
+        await fetchWithTimeout('https://www.gstatic.com/generate_204', 5000)
+        const ping = Math.round(performance.now() - start)
+        best = best === null ? ping : Math.min(best, ping)
+    }
+    return best
+}
+
+// Popup ходит в сеть через тот же прокси, что и вкладки: ipinfo.io видит внешний IP прокси,
+// а пинг — задержка всего пути. Неактивные прокси не проверяем: запрос шёл бы с реального IP
+async function checkConnection() {
+    if (!state.status || state.status.state !== 'active') return
+
+    const checkId = ++state.checkId
+    const profileId = state.status.profile.id
+    state.checking = true
+    renderHero()
+
+    let exit
+    try {
+        const info = await (await fetchWithTimeout('https://ipinfo.io/json', 6000)).json()
+        exit = {
+            ip: info.ip,
+            country: /^[A-Z]{2}$/.test(info.country) ? info.country : null,
+            ping: await measurePing().catch(() => null),
+        }
+    } catch (error) {
+        console.log('Нет ответа через прокси:', error)
+        exit = { error: true }
+    }
+
+    if (checkId !== state.checkId) return
+    state.checking = false
+    state.exit = exit
+    renderHero()
+
+    if (!exit.error) {
+        chrome.runtime.sendMessage({ action: 'exitInfo', profileId, exit }).catch(() => {})
+    }
+}
+
+// Геолокация серверов прокси для флагов. В ipinfo.io ходим только через активный прокси:
+// без него ipinfo получил бы с реального IP весь список прокси
+async function loadMissingGeo() {
+    const queue = [...new Set(state.profiles.map((p) => p.host))].filter((host) => !state.geoCache[host] && !state.geoTried.has(host))
+    if (queue.length === 0) return
+    queue.forEach((host) => state.geoTried.add(host))
+
+    let changed = false
+    const worker = async () => {
+        while (queue.length > 0 && state.status && state.status.state === 'active') {
+            const host = queue.shift()
+            try {
+                const data = await (await fetchWithTimeout(`https://ipinfo.io/${encodeURIComponent(host)}/json`, 6000)).json()
+                if (/^[A-Z]{2}$/.test(data.country)) {
+                    state.geoCache[host] = { country: data.country }
+                    changed = true
+                }
+            } catch (error) {
+                console.log('Нет геолокации для', host, error.message)
+            }
+        }
+    }
+    await Promise.all([worker(), worker(), worker()])
+
+    if (changed) {
+        await chrome.storage.local.set({ geoCache: state.geoCache })
+        renderProfiles()
+    }
+}
+
+// Профили
 async function saveProfiles() {
-    await chrome.storage.local.set({
-        profiles: state.profiles,
-        geoCache: state.geoCache,
+    await chrome.storage.local.set({ profiles: state.profiles })
+}
+
+function nextProfileName(offset = 0) {
+    const numbers = state.profiles.map((p) => /^Профиль (\d+)$/.exec(p.name)).filter(Boolean).map((m) => Number(m[1]))
+    return `Профиль ${Math.max(state.profiles.length, ...numbers) + 1 + offset}`
+}
+
+function newId() {
+    return crypto.randomUUID()
+}
+
+// Строка в формате, который понимает импорт
+function proxyString(profile) {
+    const scheme = profile.type !== 'http' ? `${profile.type}://` : ''
+    const auth = profile.username && profile.password ? `${profile.username}:${profile.password}@` : ''
+    return `${scheme}${auth}${profile.host}:${profile.port}`
+}
+
+async function copyText(text, message) {
+    try {
+        await navigator.clipboard.writeText(text)
+        showToast(message)
+    } catch (error) {
+        showToast('Не удалось скопировать', { error: true })
+    }
+}
+
+function deleteProfile(id) {
+    const index = state.profiles.findIndex((p) => p.id === id)
+    if (index === -1) return
+
+    const [profile] = state.profiles.splice(index, 1)
+    const wasActive = state.status && state.status.state !== 'off' && state.status.profile.id === id
+    saveProfiles()
+    renderProfiles()
+    renderHero()
+    if (wasActive) disconnect()
+
+    showToast(wasActive ? 'Профиль удалён, прокси отключён' : 'Профиль удалён', {
+        action: 'Вернуть',
+        onAction: () => {
+            state.profiles.splice(Math.min(index, state.profiles.length), 0, profile)
+            saveProfiles()
+            renderProfiles()
+            renderHero()
+        },
     })
 }
 
-// Получение геолокации по IP
-async function getCountryInfo(ip) {
-    if (state.geoCache[ip]) {
-        return state.geoCache[ip]
+// Нижние панели
+function openSheet(sheet) {
+    closeSheets()
+    els.overlay.classList.add('is-open')
+    sheet.classList.add('is-open')
+}
+
+function closeSheets() {
+    els.overlay.classList.remove('is-open')
+    document.querySelectorAll('.sheet.is-open').forEach((sheet) => sheet.classList.remove('is-open'))
+    state.editingId = null
+}
+
+function bindSegmented(container, onChange) {
+    container.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-value]')
+        if (btn) onChange(btn.dataset.value)
+    })
+}
+
+function selectSegment(container, value) {
+    container.querySelectorAll('button').forEach((btn) => {
+        const selected = btn.dataset.value === value
+        btn.classList.toggle('is-selected', selected)
+        btn.setAttribute('aria-checked', selected)
+    })
+}
+
+// Форма профиля
+function openProfileSheet(id = null) {
+    const profile = id ? state.profiles.find((p) => p.id === id) : null
+    openSheet(els.profileSheet)
+    state.editingId = profile ? profile.id : null
+
+    els.profileSheetTitle.textContent = profile ? 'Редактирование' : 'Новый прокси'
+    els.quickInput.value = ''
+    setText(els.quickHint, QUICK_HINT)
+    els.nameInput.value = profile ? profile.name : ''
+    els.nameInput.placeholder = profile ? '' : nextProfileName()
+    setFormType(profile ? profile.type : 'http')
+    els.hostInput.value = profile ? profile.host : ''
+    els.portInput.value = profile ? profile.port : ''
+    els.userInput.value = profile ? profile.username || '' : ''
+    els.passInput.value = profile ? profile.password || '' : ''
+    els.passInput.type = 'password'
+    clearFormError()
+
+    setTimeout(() => (profile ? els.nameInput : els.quickInput).focus(), 50)
+}
+
+function setFormType(type) {
+    state.formType = type
+    selectSegment(els.typeSeg, type)
+
+    // Chrome не умеет логин и пароль для SOCKS — вместо полей пояснение той же высоты
+    const isSocks = type !== 'http'
+    els.authFields.classList.toggle('hidden', isSocks)
+    els.socksNote.classList.toggle('hidden', !isSocks)
+    if (type === 'socks4') {
+        els.socksNote.textContent = 'SOCKS4 отправляет DNS-запросы мимо прокси: провайдер видит, какие сайты вы открываете. Если можно, берите SOCKS5.'
+        els.socksNote.className = 'note is-warn'
+    } else if (isSocks) {
+        els.socksNote.textContent = 'Логин и пароль для SOCKS Chrome не поддерживает — нужен прокси с доступом по IP.'
+        els.socksNote.className = 'note'
+    }
+}
+
+function onQuickInput() {
+    const value = els.quickInput.value.trim()
+    if (!value) {
+        setText(els.quickHint, QUICK_HINT)
+        return
     }
 
-    try {
-        const response = await fetch(`https://ipinfo.io/${ip}/json`)
-        if (response.ok) {
-            const data = await response.json()
-            if (data.country) {
-                const result = {
-                    country: data.country,
-                    countryName: getCountryName(data.country),
-                    flagUrl: getFlagUrl(data.country),
-                }
-                state.geoCache[ip] = result
-                await saveProfiles()
-                return result
+    const parsed = parseProxyString(value, state.formType)
+    if (!parsed) {
+        setText(els.quickHint, 'Формат не распознан', 'is-bad')
+        return
+    }
+
+    setFormType(parsed.type)
+    els.hostInput.value = parsed.host
+    els.portInput.value = parsed.port
+    clearFormError()
+
+    if (parsed.type !== 'http' && parsed.username) {
+        els.userInput.value = ''
+        els.passInput.value = ''
+        setText(els.quickHint, 'Логин и пароль для SOCKS Chrome не поддерживает', 'is-bad')
+        return
+    }
+
+    els.userInput.value = parsed.username
+    els.passInput.value = parsed.password
+    setText(els.quickHint, `Распознано: ${TYPE_LABELS[parsed.type]}${parsed.username ? ' с логином и паролем' : ''}`, 'is-ok')
+}
+
+function formError(input, message) {
+    input.classList.add('is-invalid')
+    els.formError.textContent = message
+    input.focus()
+}
+
+function clearFormError() {
+    els.formError.textContent = ''
+    els.profileForm.querySelectorAll('.is-invalid').forEach((input) => input.classList.remove('is-invalid'))
+}
+
+async function onProfileSubmit(e) {
+    e.preventDefault()
+    clearFormError()
+
+    const host = els.hostInput.value.trim()
+    const port = Number(els.portInput.value.trim())
+    const isHttp = state.formType === 'http'
+    const username = isHttp ? els.userInput.value.trim() : ''
+    // Пароль не обрезаем: пробелы по краям могут быть его частью
+    const password = isHttp ? els.passInput.value : ''
+
+    if (!host) return formError(els.hostInput, 'Укажите адрес прокси')
+    if (!HOST_PATTERN.test(host)) return formError(els.hostInput, 'Адрес — это IP или домен, без схемы и порта')
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return formError(els.portInput, 'Порт — число от 1 до 65535')
+    if (!!username !== !!password) return formError(username ? els.passInput : els.userInput, 'Укажите и логин, и пароль')
+
+    const editingId = state.editingId
+    const name = els.nameInput.value.trim() || nextProfileName()
+    const duplicate = state.profiles.find((p) => p.name.toLowerCase() === name.toLowerCase() && p.id !== editingId)
+    if (duplicate) return formError(els.nameInput, 'Профиль с таким названием уже есть')
+
+    const profile = { id: editingId || newId(), name, type: state.formType, host, port: String(port), username, password }
+    if (editingId) {
+        state.profiles[state.profiles.findIndex((p) => p.id === editingId)] = profile
+    } else {
+        state.profiles.push(profile)
+    }
+
+    await saveProfiles()
+    closeSheets()
+
+    // Изменения активного профиля применяем сразу, иначе трафик идёт на старый адрес со старым паролем
+    const isActive = state.status && state.status.state !== 'off' && state.status.profile.id === profile.id
+    if (isActive) {
+        await connect(profile.id)
+        showToast('Сохранено и применено')
+    } else {
+        renderProfiles()
+        renderHero()
+        showToast(editingId ? 'Сохранено' : 'Прокси добавлен', editingId ? {} : { action: 'Подключить', onAction: () => connect(profile.id) })
+    }
+}
+
+// Парсинг строки прокси: [scheme://]host:port:user:pass, [scheme://]user:pass@host:port, [scheme://]host:port
+function parseProxyString(line, defaultType = 'http') {
+    line = line.trim()
+    if (!line) return null
+
+    let type = defaultType
+    const scheme = line.match(/^(http|socks4|socks5|socks):\/\//i)
+    if (scheme) {
+        type = scheme[1].toLowerCase() === 'socks' ? 'socks5' : scheme[1].toLowerCase()
+        line = line.slice(scheme[0].length)
+    } else if (/^[a-z0-9]+:\/\//i.test(line)) {
+        return null
+    }
+
+    // host:port:user:pass проверяем первым: логин может быть e-mail с @
+    let match = line.match(/^([a-z0-9_.-]+):(\d{1,5}):([^:]+):(.+)$/i)
+    if (match) {
+        return { type, host: match[1], port: parseInt(match[2]), username: match[3], password: match[4] }
+    }
+
+    // user:pass@host:port — в пароле могут быть @ и :, поэтому делим по последней @
+    const at = line.lastIndexOf('@')
+    if (at !== -1) {
+        const credentials = line.slice(0, at)
+        const colon = credentials.indexOf(':')
+        match = line.slice(at + 1).match(/^([a-z0-9_.-]+):(\d{1,5})$/i)
+        if (match && colon > 0) {
+            return {
+                type,
+                host: match[1],
+                port: parseInt(match[2]),
+                username: credentials.slice(0, colon),
+                password: credentials.slice(colon + 1),
             }
         }
-    } catch (error) {
-        console.log('Ошибка ipinfo.io:', error)
+        return null
     }
 
-    return { country: 'UN', countryName: 'Неизвестно', flagUrl: getFlagUrl('UN') }
+    match = line.match(/^([a-z0-9_.-]+):(\d{1,5})$/i)
+    if (match) {
+        return { type, host: match[1], port: parseInt(match[2]), username: '', password: '' }
+    }
+
+    return null
 }
 
-// Получение URL флага по коду страны
-function getFlagUrl(countryCode) {
-    if (!countryCode || countryCode.length !== 2) {
-        return 'https://flagcdn.com/w20/un.png'
-    }
-    return `https://flagcdn.com/w20/${countryCode.toLowerCase()}.png`
+// Импорт
+function openImportSheet() {
+    openSheet(els.importSheet)
+    els.importText.value = ''
+    selectSegment(els.importTypeSeg, state.importType)
+    els.exportBtn.classList.toggle('hidden', state.profiles.length === 0)
+    updateImportPreview()
+    setTimeout(() => els.importText.focus(), 50)
 }
+
+function analyzeImport(text, defaultType) {
+    const items = []
+    const errors = []
+    const seen = new Set(state.profiles.map((p) => `${p.host}:${p.port}`))
+    let duplicates = 0
+
+    text.split('\n').forEach((raw, i) => {
+        const line = raw.trim()
+        if (!line) return
+
+        const parsed = parseProxyString(line, defaultType)
+        if (!parsed) return errors.push(`Строка ${i + 1}: формат не распознан`)
+        if (parsed.port < 1 || parsed.port > 65535) return errors.push(`Строка ${i + 1}: неверный порт`)
+        if (parsed.type !== 'http' && parsed.username) return errors.push(`Строка ${i + 1}: логин для SOCKS Chrome не поддерживает`)
+
+        const key = `${parsed.host}:${parsed.port}`
+        if (seen.has(key)) {
+            duplicates++
+            return
+        }
+        seen.add(key)
+        items.push(parsed)
+    })
+
+    return { items, duplicates, errors }
+}
+
+function updateImportPreview() {
+    const text = els.importText.value
+    const { items, duplicates, errors } = analyzeImport(text, state.importType)
+
+    if (!text.trim()) {
+        els.importSummary.innerHTML = 'Форматы: <code>user:pass@ip:port</code>, <code>ip:port:user:pass</code>, <code>ip:port</code>. Схема в начале строки задаёт тип.'
+    } else {
+        const parts = [`Новых <b class="mono">${items.length}</b>`]
+        if (duplicates) parts.push(`уже есть <b class="mono">${duplicates}</b>`)
+        if (errors.length) parts.push(`<span class="is-bad">ошибок <b class="mono">${errors.length}</b></span>`)
+        els.importSummary.innerHTML = parts.join(' · ')
+    }
+
+    const shown = errors.slice(0, errors.length > 3 ? 2 : 3)
+    els.importErrors.innerHTML =
+        shown.map((error) => `<div>${escapeHtml(error)}</div>`).join('') + (errors.length > shown.length ? `<div>…и ещё ${errors.length - shown.length}</div>` : '')
+
+    els.confirmImportBtn.disabled = items.length === 0
+    els.confirmImportBtn.textContent = items.length ? `Импортировать ${items.length}` : 'Импортировать'
+}
+
+async function doImport() {
+    const { items } = analyzeImport(els.importText.value, state.importType)
+    if (items.length === 0) return
+
+    const profiles = items.map((item, i) => ({
+        id: newId(),
+        name: nextProfileName(i),
+        type: item.type,
+        host: item.host,
+        port: String(item.port),
+        username: item.username,
+        password: item.password,
+    }))
+    state.profiles.push(...profiles)
+
+    await saveProfiles()
+    closeSheets()
+    renderProfiles()
+    renderHero()
+    showToast(`Импортировано: ${profiles.length}`)
+    if (state.status.state === 'active') loadMissingGeo()
+}
+
+function exportProfiles() {
+    copyText(state.profiles.map(proxyString).join('\n'), `Скопировано профилей: ${state.profiles.length}`)
+}
+
+// Уведомление
+let toastTimer = null
+
+function showToast(message, { error = false, action = '', onAction = null } = {}) {
+    clearTimeout(toastTimer)
+    els.toastText.textContent = message
+    els.toast.classList.toggle('is-error', error)
+    els.toastAction.classList.toggle('hidden', !action)
+    els.toastAction.textContent = action
+    els.toastAction.onclick = action
+        ? () => {
+              hideToast()
+              onAction()
+          }
+        : null
+    els.toast.classList.add('is-shown')
+    toastTimer = setTimeout(hideToast, action ? 5000 : error ? 4000 : 2200)
+}
+
+function hideToast() {
+    els.toast.classList.remove('is-shown')
+}
+
+// Экранирование HTML (в том числе кавычек — значения попадают и в атрибуты)
+function escapeHtml(text) {
+    const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
+    return String(text).replace(/[&<>"']/g, (char) => entities[char])
+}
+
+function capitalize(text) {
+    return text ? text[0].toUpperCase() + text.slice(1) : ''
+}
+
+// Обработка сообщений от background
+chrome.runtime.onMessage.addListener((message) => {
+    if (message.action === 'proxyError') {
+        showToast(`Ошибка прокси: ${message.error}`, { error: true })
+    }
+})
 
 // База названий стран
 function getCountryName(countryCode) {
@@ -408,712 +1201,3 @@ function getCountryName(countryCode) {
     }
     return countries[countryCode] || countryCode
 }
-
-// Проверка реального пинга прокси
-async function checkProxyPing(host, port) {
-    console.log(`🏓 Начинаем проверку пинга для ${host}:${port}`)
-
-    // Попробуем несколько методов проверки
-    const methods = [() => checkTCPConnection(host, port), () => checkHTTPConnection(host, port), () => checkWebSocketConnection(host, port)]
-
-    for (const method of methods) {
-        try {
-            const ping = await method()
-            if (ping !== null && ping > 0) {
-                console.log(`✅ Успешный пинг ${host}:${port} = ${ping}ms`)
-                return ping
-            }
-        } catch (error) {
-            console.log(`⚠️ Метод не сработал для ${host}:${port}:`, error.message)
-        }
-    }
-
-    // Если все методы не сработали, возвращаем null для индикации недоступности
-    console.log(`❌ Все методы пинга не сработали для ${host}:${port}`)
-    return null
-}
-
-// Метод 1: Попытка TCP соединения через fetch с таймаутом
-async function checkTCPConnection(host, port) {
-    const start = performance.now()
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 2000)
-
-    try {
-        // Пробуем подключиться к прокси серверу
-        const response = await fetch(`http://${host}:${port}`, {
-            method: 'HEAD',
-            mode: 'no-cors',
-            signal: controller.signal,
-            cache: 'no-cache',
-            headers: {
-                'Cache-Control': 'no-cache',
-                Pragma: 'no-cache',
-            },
-        })
-
-        clearTimeout(timeout)
-        const ping = Math.round(performance.now() - start)
-        return ping
-    } catch (error) {
-        clearTimeout(timeout)
-        // Если ошибка связана с сетью, но не с таймаутом - это может быть хорошо
-        if (error.name === 'TypeError' && error.message.includes('Failed to fetch')) {
-            // Прокси может отклонить соединение, но это значит что он отвечает
-            const ping = Math.round(performance.now() - start)
-            if (ping < 2000) {
-                // Если ответ быстрый, считаем что сервер доступен
-                return ping
-            }
-        }
-        throw error
-    }
-}
-
-// Метод 2: HTTP запрос через известный сервис
-async function checkHTTPConnection(host, port) {
-    const start = performance.now()
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 3000)
-
-    try {
-        // Проверяем доступность через публичный сервис
-        const testUrl = 'https://postman-echo.com/get'
-
-        // Имитируем подключение через прокси (для демонстрации скорости)
-        await fetch(testUrl, {
-            method: 'GET',
-            signal: controller.signal,
-            cache: 'no-cache',
-            headers: {
-                'Cache-Control': 'no-cache',
-                'X-Forwarded-For': host, // Добавляем IP для различия запросов
-            },
-        })
-
-        clearTimeout(timeout)
-        return Math.round(performance.now() - start)
-    } catch (error) {
-        clearTimeout(timeout)
-        throw error
-    }
-}
-
-// Метод 3: WebSocket попытка подключения
-async function checkWebSocketConnection(host, port) {
-    return new Promise((resolve, reject) => {
-        const start = performance.now()
-        let resolved = false
-
-        const timeout = setTimeout(() => {
-            if (!resolved) {
-                resolved = true
-                reject(new Error('WebSocket timeout'))
-            }
-        }, 2000)
-
-        try {
-            // Пробуем WebSocket соединение (быстро закрывается)
-            const ws = new WebSocket(`ws://${host}:${port}`)
-
-            ws.onopen = () => {
-                if (!resolved) {
-                    resolved = true
-                    clearTimeout(timeout)
-                    ws.close()
-                    resolve(Math.round(performance.now() - start))
-                }
-            }
-
-            ws.onerror = ws.onclose = () => {
-                if (!resolved) {
-                    resolved = true
-                    clearTimeout(timeout)
-                    // Даже если соединение не удалось, но ответ быстрый - сервер отвечает
-                    const ping = Math.round(performance.now() - start)
-                    if (ping < 1000) {
-                        resolve(ping)
-                    } else {
-                        reject(new Error('WebSocket connection failed'))
-                    }
-                }
-            }
-        } catch (error) {
-            clearTimeout(timeout)
-            reject(error)
-        }
-    })
-}
-
-// Более реалистичная симуляция на основе геолокации + random
-function simulatePingByLocation(host) {
-    console.log(`🎲 Симулируем пинг для ${host}`)
-
-    // Базовый пинг в зависимости от последнего октета IP
-    const lastOctet = parseInt(host.split('.').pop() || '0')
-    const basePing = 30 + (lastOctet % 200)
-
-    // Добавляем случайность ±30ms
-    const randomOffset = (Math.random() - 0.5) * 60
-    const finalPing = Math.max(20, Math.round(basePing + randomOffset))
-
-    console.log(`🎯 Симулированный пинг для ${host}: ${finalPing}ms`)
-    return finalPing
-}
-
-// Получение класса для пинга
-function getPingClass(ping) {
-    if (ping === null || ping === undefined) return 'bad'
-    if (ping < 80) return 'good'
-    if (ping < 200) return 'medium'
-    return 'bad'
-}
-
-// Форматирование пинга
-function formatPing(ping) {
-    if (ping === null || ping === undefined) return 'N/A'
-    return `${ping}ms`
-}
-
-// Добавляем кнопку для принудительного обновления пингов
-function addPingRefreshButton() {
-    const sectionHeader = document.querySelector('.section-header')
-    if (sectionHeader && !document.getElementById('refreshPingBtn')) {
-        const refreshBtn = document.createElement('button')
-        refreshBtn.id = 'refreshPingBtn'
-        refreshBtn.className = 'import-btn'
-        refreshBtn.innerHTML = '↻' // Заменил emoji на более стильный символ
-        refreshBtn.title = 'Обновить пинги'
-
-        refreshBtn.addEventListener('click', async () => {
-            refreshBtn.style.transform = 'rotate(360deg)'
-            refreshBtn.style.transition = 'transform 0.5s ease'
-
-            await updatePings()
-
-            setTimeout(() => {
-                refreshBtn.style.transform = 'rotate(0deg)'
-            }, 500)
-        })
-
-        const headerActions = sectionHeader.querySelector('.header-actions')
-        headerActions.insertBefore(refreshBtn, headerActions.firstChild)
-    }
-}
-
-// Обновление статуса
-async function updateStatus() {
-    await chrome.runtime.sendMessage({ action: 'syncState' })
-    const response = await chrome.runtime.sendMessage({ action: 'getStatus' })
-
-    // Обновляем состояние WebRTC переключателя
-    elements.webrtcToggle.checked = response.webrtcBlocked
-
-    if (response.isActive && response.activeProfile) {
-        const geoInfo = await getCountryInfo(response.activeProfile.host)
-
-        // Обновляем текст статуса
-        const statusText = elements.status.querySelector('.status-text')
-        statusText.innerHTML = `Подключен: <img class="country-flag" src="${geoInfo.flagUrl}" alt="${geoInfo.country}" title="${
-            geoInfo.countryName
-        }" style="width: 20px; height: 15px; margin-right: 6px; border-radius: 2px; border: 1px solid var(--border);"> <span class="status-profile">${escapeHtml(
-            response.activeProfile.name
-        )}</span>`
-
-        elements.status.className = 'status active'
-        elements.toggleBtn.className = 'toggle-btn'
-        elements.toggleBtn.textContent = '×'
-        elements.toggleBtn.title = 'Отключить прокси'
-        state.activeProfileId = response.activeProfile.id
-    } else {
-        const statusText = elements.status.querySelector('.status-text')
-        statusText.textContent = 'Прямое подключение'
-        elements.status.className = 'status'
-        elements.toggleBtn.className = 'toggle-btn hidden'
-        state.activeProfileId = null
-    }
-
-    renderProfiles()
-}
-
-// Обновление пингов для всех профилей
-async function updatePings() {
-    if (state.profiles.length === 0) return
-
-    console.log('🏓 Начинаем обновление пингов для', state.profiles.length, 'профилей...')
-
-    // Добавляем задержку для лучшего UX
-    const updatePromises = state.profiles.map(async (profile, index) => {
-        // Добавляем небольшую задержку между запросами
-        await new Promise((resolve) => setTimeout(resolve, index * 100))
-
-        try {
-            console.log(`🔄 Проверяем пинг для ${profile.name} (${profile.host}:${profile.port})`)
-
-            // Сначала показываем индикатор загрузки
-            const pingElement = document.querySelector(`[data-host="${profile.host}"][data-port="${profile.port}"]`)
-            if (pingElement) {
-                pingElement.textContent = '⏱'
-                pingElement.className = 'ping-info'
-                pingElement.title = 'Проверка пинга...'
-            }
-
-            const ping = await checkProxyPing(profile.host, profile.port)
-
-            // Обновляем отображение результата
-            if (pingElement) {
-                if (ping !== null) {
-                    pingElement.textContent = formatPing(ping)
-                    pingElement.className = `ping-info ${getPingClass(ping)}`
-                    pingElement.title = `Пинг: ${formatPing(ping)}`
-                    console.log(`✅ Пинг для ${profile.name}: ${ping}ms`)
-                } else {
-                    pingElement.textContent = 'N/A'
-                    pingElement.className = 'ping-info bad'
-                    pingElement.title = 'Сервер недоступен'
-                    console.log(`❌ Сервер ${profile.name} недоступен`)
-                }
-            }
-        } catch (error) {
-            console.error(`❌ Ошибка проверки пинга для ${profile.name}:`, error)
-
-            const pingElement = document.querySelector(`[data-host="${profile.host}"][data-port="${profile.port}"]`)
-            if (pingElement) {
-                // При ошибке используем симуляцию
-                const simulatedPing = simulatePingByLocation(profile.host)
-                pingElement.textContent = `~${simulatedPing}ms`
-                pingElement.className = `ping-info ${getPingClass(simulatedPing)}`
-                pingElement.title = `Примерный пинг: ~${simulatedPing}ms (симуляция)`
-            }
-        }
-    })
-
-    await Promise.all(updatePromises)
-    console.log('✅ Все пинги обновлены!')
-}
-
-// Отрисовка профилей
-async function renderProfiles() {
-    if (state.profiles.length === 0) {
-        elements.profilesList.innerHTML = `
-            <div class="empty-state">
-                Нет сохраненных профилей<br>
-                <small>Нажмите + чтобы добавить</small>
-            </div>
-        `
-        return
-    }
-
-    elements.profilesList.innerHTML = state.profiles
-        .map(
-            (profile) => `
-        <div class="profile-item ${profile.id === state.activeProfileId ? 'active' : ''}" 
-             data-id="${profile.id}">
-            <div class="profile-info">
-                <div class="profile-name">
-                    <img class="country-flag" data-ip="${
-                        profile.host
-                    }" src="https://flagcdn.com/w20/un.png" alt="?" onerror="this.style.display='none'">
-                    ${escapeHtml(profile.name)}
-                </div>
-                <div class="profile-details">
-                    <span>${profile.host}</span>
-                    <span class="ping-info" data-host="${profile.host}" data-port="${profile.port}" title="Нажмите ↻ для обновления">⏱</span>
-                </div>
-            </div>
-            <div class="profile-actions">
-                <button class="profile-btn copy-btn" data-id="${profile.id}" title="Копировать прокси">📋</button>
-                <button class="profile-btn edit-btn" data-id="${profile.id}" title="Редактировать">✎</button>
-                <button class="profile-btn delete-btn" data-id="${profile.id}" title="Удалить">×</button>
-            </div>
-        </div>
-    `
-        )
-        .join('')
-
-    bindProfileEvents()
-    addPingRefreshButton() // Добавляем кнопку обновления пингов
-
-    // Асинхронно загружаем только геолокацию (без блокировки UI)
-    state.profiles.forEach(async (profile) => {
-        try {
-            const geoInfo = await getCountryInfo(profile.host)
-            const flagElement = document.querySelector(`img[data-ip="${profile.host}"]`)
-            if (flagElement && geoInfo.flagUrl) {
-                flagElement.src = geoInfo.flagUrl
-                flagElement.alt = geoInfo.country
-                flagElement.title = `${geoInfo.countryName} (${geoInfo.country})`
-                flagElement.style.display = 'block'
-            }
-        } catch (error) {
-            console.log('Ошибка загрузки геолокации для', profile.host, error)
-        }
-    })
-}
-
-// Привязка событий к профилям
-function bindProfileEvents() {
-    elements.profilesList.querySelectorAll('.profile-item').forEach((item) => {
-        item.addEventListener('click', (e) => {
-            const profileId = item.dataset.id
-            activateProfile(profileId)
-        })
-    })
-
-    elements.profilesList.querySelectorAll('.copy-btn').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation()
-            copyProxy(btn.dataset.id)
-        })
-    })
-
-    elements.profilesList.querySelectorAll('.edit-btn').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation()
-            editProfile(btn.dataset.id)
-        })
-    })
-
-    elements.profilesList.querySelectorAll('.delete-btn').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation()
-            deleteProfile(btn.dataset.id)
-        })
-    })
-}
-
-// Переключение прокси
-async function toggleProxy() {
-    if (state.activeProfileId) {
-        await chrome.runtime.sendMessage({ action: 'disableProxy' })
-        await updateStatus()
-    }
-}
-
-// Активация профиля
-async function activateProfile(profileId) {
-    const profile = state.profiles.find((p) => p.id === profileId)
-    if (!profile) return
-
-    console.log('Активация профиля:', profile)
-
-    const response = await chrome.runtime.sendMessage({
-        action: 'applyProxy',
-        profile,
-    })
-
-    if (response.success) {
-        state.activeProfileId = profileId
-        await updateStatus()
-    } else {
-        showToast('Ошибка подключения: ' + response.error, true)
-    }
-}
-
-// Копирование прокси в буфер обмена
-async function copyProxy(profileId) {
-    const profile = state.profiles.find((p) => p.id === profileId)
-    if (!profile) return
-
-    let proxyString = ''
-
-    if (profile.username && profile.password) {
-        proxyString = `${profile.username}:${profile.password}@${profile.host}:${profile.port}`
-    } else {
-        proxyString = `${profile.host}:${profile.port}`
-    }
-
-    try {
-        await navigator.clipboard.writeText(proxyString)
-        showToast('Прокси скопирован в буфер обмена')
-    } catch (error) {
-        try {
-            const textArea = document.createElement('textarea')
-            textArea.value = proxyString
-            document.body.appendChild(textArea)
-            textArea.select()
-            document.execCommand('copy')
-            document.body.removeChild(textArea)
-            showToast('Прокси скопирован в буфер обмена')
-        } catch (fallbackError) {
-            showToast('Ошибка копирования', true)
-        }
-    }
-}
-
-// Показ формы добавления
-function showAddForm() {
-    state.editingId = null
-    elements.modalTitle.textContent = 'Новый профиль'
-    elements.profileForm.reset()
-    elements.useAuth.checked = false
-    toggleAuthFields()
-    elements.modal.classList.remove('hidden')
-    document.getElementById('name').focus()
-}
-
-// Показ формы импорта
-function showImportForm() {
-    elements.importText.value = ''
-    elements.importModal.classList.remove('hidden')
-    elements.importText.focus()
-}
-
-// Скрытие формы импорта
-function hideImportModal() {
-    elements.importModal.classList.add('hidden')
-    elements.importText.value = ''
-}
-
-// Парсинг строки прокси
-function parseProxyString(line) {
-    line = line.trim()
-    if (!line) return null
-
-    let match = line.match(/^(.+?):(.+?)@(.+?):(\d+)$/)
-    if (match) {
-        return {
-            username: match[1],
-            password: match[2],
-            host: match[3],
-            port: parseInt(match[4]),
-        }
-    }
-
-    match = line.match(/^(.+?):(\d+):(.+?):(.+?)$/)
-    if (match) {
-        return {
-            host: match[1],
-            port: parseInt(match[2]),
-            username: match[3],
-            password: match[4],
-        }
-    }
-
-    match = line.match(/^(.+?):(\d+)$/)
-    if (match) {
-        return {
-            host: match[1],
-            port: parseInt(match[2]),
-            username: '',
-            password: '',
-        }
-    }
-
-    return null
-}
-
-// Обработка импорта
-async function handleImport() {
-    const text = elements.importText.value.trim()
-    if (!text) {
-        showToast('Введите данные для импорта', true)
-        return
-    }
-
-    const lines = text.split('\n')
-    const imported = []
-    const errors = []
-
-    // Исправление: начинаем счетчик с количества существующих профилей + 1
-    let profileCounter = state.profiles.length + 1
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim()
-        if (!line) continue
-
-        const parsed = parseProxyString(line)
-        if (parsed) {
-            if (parsed.port < 1 || parsed.port > 65535) {
-                errors.push(`Строка ${i + 1}: неверный порт`)
-                continue
-            }
-
-            const profile = {
-                id: Date.now().toString() + Math.random(),
-                name: `Профиль ${profileCounter}`,
-                type: 'http',
-                host: parsed.host,
-                port: parsed.port.toString(),
-                username: parsed.username || '',
-                password: parsed.password || '',
-            }
-
-            const duplicate = state.profiles.find((p) => p.host === profile.host && p.port === profile.port)
-            if (!duplicate) {
-                imported.push(profile)
-                profileCounter++ // Увеличиваем счетчик только для успешно добавленных профилей
-            }
-        } else {
-            errors.push(`Строка ${i + 1}: неверный формат`)
-        }
-    }
-
-    if (imported.length > 0) {
-        state.profiles.push(...imported)
-        await saveProfiles()
-        renderProfiles()
-        hideImportModal()
-        showToast(`Импортировано профилей: ${imported.length}`)
-    }
-
-    if (errors.length > 0) {
-        showToast(`Ошибки: ${errors.length}`, true)
-        console.log('Ошибки импорта:', errors)
-    }
-}
-
-// Редактирование профиля
-function editProfile(profileId) {
-    const profile = state.profiles.find((p) => p.id === profileId)
-    if (!profile) return
-
-    state.editingId = profileId
-    elements.modalTitle.textContent = 'Редактировать профиль'
-
-    document.getElementById('editId').value = profileId
-    document.getElementById('name').value = profile.name
-    document.getElementById('type').value = profile.type
-    document.getElementById('host').value = profile.host
-    document.getElementById('port').value = profile.port
-
-    const hasAuth = profile.username && profile.password
-    elements.useAuth.checked = hasAuth
-
-    if (hasAuth) {
-        document.getElementById('username').value = profile.username
-        document.getElementById('password').value = profile.password
-    }
-
-    toggleAuthFields()
-    elements.modal.classList.remove('hidden')
-}
-
-// Удаление профиля
-async function deleteProfile(profileId) {
-    if (!confirm('Удалить этот профиль?')) return
-
-    state.profiles = state.profiles.filter((p) => p.id !== profileId)
-
-    if (profileId === state.activeProfileId) {
-        await chrome.runtime.sendMessage({ action: 'disableProxy' })
-        await updateStatus()
-    }
-
-    await saveProfiles()
-    renderProfiles()
-    showToast('Профиль удален')
-}
-
-// Скрытие модального окна
-function hideModal() {
-    elements.modal.classList.add('hidden')
-    elements.profileForm.reset()
-    state.editingId = null
-}
-
-// Переключение полей авторизации
-function toggleAuthFields() {
-    if (elements.useAuth.checked) {
-        elements.authFields.classList.remove('hidden')
-    } else {
-        elements.authFields.classList.add('hidden')
-        document.getElementById('username').value = ''
-        document.getElementById('password').value = ''
-    }
-}
-
-// Обработка отправки формы
-async function handleFormSubmit(e) {
-    e.preventDefault()
-
-    const formData = new FormData(e.target)
-    const profile = {
-        id: state.editingId || Date.now().toString(),
-        name: formData.get('name').trim(),
-        type: formData.get('type'),
-        host: formData.get('host').trim(),
-        port: formData.get('port'),
-        username: elements.useAuth.checked ? formData.get('username').trim() : '',
-        password: elements.useAuth.checked ? formData.get('password').trim() : '',
-    }
-
-    if (!profile.name || !profile.host || !profile.port) {
-        showToast('Заполните все обязательные поля', true)
-        return
-    }
-
-    const port = parseInt(profile.port)
-    if (isNaN(port) || port < 1 || port > 65535) {
-        showToast('Некорректный порт', true)
-        return
-    }
-
-    const duplicate = state.profiles.find((p) => p.name.toLowerCase() === profile.name.toLowerCase() && p.id !== profile.id)
-    if (duplicate) {
-        showToast('Профиль с таким именем уже существует', true)
-        return
-    }
-
-    if (state.editingId) {
-        const index = state.profiles.findIndex((p) => p.id === state.editingId)
-        state.profiles[index] = profile
-        showToast('Профиль обновлен')
-    } else {
-        state.profiles.push(profile)
-        showToast('Профиль создан')
-    }
-
-    await saveProfiles()
-    renderProfiles()
-    hideModal()
-}
-
-// Показ уведомления
-function showToast(message, isError = false) {
-    const toast = document.createElement('div')
-    toast.style.cssText = `
-        position: fixed;
-        top: 10px;
-        left: 50%;
-        transform: translateX(-50%);
-        background: ${isError ? '#ef4444' : '#10b981'};
-        color: white;
-        padding: 8px 16px;
-        border-radius: 4px;
-        font-size: 14px;
-        z-index: 2000;
-        animation: slideDown 0.3s ease;
-    `
-    toast.textContent = message
-
-    document.body.appendChild(toast)
-
-    setTimeout(() => {
-        toast.remove()
-    }, 2000)
-}
-
-// Экранирование HTML
-function escapeHtml(text) {
-    const div = document.createElement('div')
-    div.textContent = text
-    return div.innerHTML
-}
-
-// Добавляем стили для анимации
-const style = document.createElement('style')
-style.textContent = `
-    @keyframes slideDown {
-        from { opacity: 0; transform: translateX(-50%) translateY(-10px); }
-        to { opacity: 1; transform: translateX(-50%) translateY(0); }
-    }
-`
-document.head.appendChild(style)
-
-// Обработка сообщений от background
-chrome.runtime.onMessage.addListener((message) => {
-    if (message.action === 'proxyError') {
-        showToast('❌ Ошибка прокси: ' + message.error, true)
-    }
-})

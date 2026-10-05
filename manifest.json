@@ -1,35 +1,34 @@
 {
     "manifest_version": 3,
     "name": "Proxy Manager",
-    "version": "1.1.1",
-    "description": "Простое управление прокси-соединениями с защитой от WebRTC",
+    "version": "1.2.0",
+    "description": "Прокси в один клик: скрывает реальный IP, защищает от утечек через WebRTC и следит, чтобы прокси действительно работал",
     "minimum_chrome_version": "108",
     "permissions": ["proxy", "storage", "declarativeNetRequest", "webRequest", "webRequestAuthProvider", "privacy"],
     "host_permissions": ["<all_urls>"],
     "background": {
         "service_worker": "background.js"
     },
-    "content_scripts": [
-        {
-            "matches": ["<all_urls>"],
-            "js": ["webrtc-block.js"],
-            "run_at": "document_start"
-        }
-    ],
     "action": {
         "default_popup": "popup.html",
+        "default_title": "Proxy Manager",
         "default_icon": {
-            "16": "icon16.png",
-            "48": "icon48.png",
-            "128": "icon128.png"
+            "16": "icons/icon16-off.png",
+            "32": "icons/icon32-off.png"
         }
     },
     "icons": {
-        "16": "icon16.png",
-        "48": "icon48.png",
-        "128": "icon128.png"
+        "16": "icons/icon16.png",
+        "32": "icons/icon32.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
     },
-    "declarative_net_request": {
-        "rule_resources": []
+    "commands": {
+        "toggle-proxy": {
+            "suggested_key": {
+                "default": "Alt+Shift+P"
+            },
+            "description": "Включить или выключить прокси"
+        }
     }
 }
